@@ -1,7 +1,7 @@
 // dp4a lowering probe: does Vector<i32,4>.dot emit a hardware integer dot on Vulkan?
 use hanzo_kernel::prelude::*;
 
-#[cube(launch_unchecked)]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 fn dp4a_kernel(a: &Array<Vector<i32, Const<4>>>, b: &Array<Vector<i32, Const<4>>>, out: &mut Array<i32>) {
     let i = ABSOLUTE_POS;
     if i < out.len() {
@@ -20,7 +20,7 @@ fn main() {
     let oh = client.create_from_slice(i32::as_bytes(&vec![0i32; n]));
     unsafe {
         dp4a_kernel::launch_unchecked::<WgpuRuntime>(
-            &client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(n as u32),
+            &client, Grid::Static(1, 1, 1), Block::new_1d(n as u32),
             ArrayArg::from_raw_parts(ah.clone(), n),
             ArrayArg::from_raw_parts(bh.clone(), n),
             ArrayArg::from_raw_parts(oh.clone(), n),

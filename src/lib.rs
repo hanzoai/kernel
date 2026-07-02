@@ -18,11 +18,26 @@
 //! noise (bench-gated). Where a hand-tuned kernel still wins, it stays as the specialized peak path and
 //! the DSL is the portable fallback for the backends that lack a tuned version.
 
-/// The kernel-authoring surface. Kernels write `use hanzo_kernel::prelude::*;` and `#[cube]`.
-/// (`cube` is re-exported here so the `cubecl` name never appears in kernel source.)
+/// The lowering engine, behind a stable path so `#[kernel]` never has to name `cubecl` and neither
+/// does kernel source. Values, not places: the engine can be swapped without touching a kernel.
+pub mod engine {
+    pub use cubecl::cube;
+}
+
+/// The kernel-authoring surface. Kernels write `use hanzo_kernel::prelude::*;` and `#[kernel(...)]`.
+///
+/// First-principles names: `#[kernel]` says what it is (a GPU kernel), not `cube` (a brand). `Grid`
+/// and `Block` name the launch shape directly -- the grid of thread blocks, and the block of threads.
+/// `Array`, `Float`, `Line` are kept: they are already the simple, accurate word for the thing.
 pub mod prelude {
     pub use cubecl::prelude::*;
-    pub use cubecl::{cube, CubeCount, CubeDim};
+    pub use hanzo_kernel_macros::{device, kernel};
+    pub use cubecl::CubeCount as Grid;
+    pub use cubecl::CubeDim as Block;
+    // Internal: `#[kernel]`/`#[device]` expand to `#[cube(...)]`, resolved via this glob. Kernel
+    // *source* only writes `#[kernel]` / `#[device]`; `cube` is never named by a human.
+    #[doc(hidden)]
+    pub use cubecl::cube;
 }
 
 pub use cubecl;

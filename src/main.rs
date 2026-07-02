@@ -91,7 +91,7 @@ fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usiz
 fn main() {
     let (rows, k) = (4096usize, 4096usize);
     let ctrl = 256usize; // small-K control: reorder noise ~ ctrl*eps, should be ~1e-6
-    println!("hanzo-kernel :: one #[cube] matvec_q8 source, lowered per backend, gated bit-exact\n");
+    println!("hanzo-kernel :: one #[device] matvec_q8 source, lowered per backend, gated bit-exact\n");
 
     #[cfg(feature = "cpu")]
     {

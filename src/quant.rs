@@ -12,7 +12,7 @@ pub const QK8_0: usize = 32;
 /// Q8_0 matvec: `out[row] = sum_k (wd[block] * wq[k]) * x[k]`, one invocation per output row.
 /// `wd`: scales, one per 32-weight block, `[rows * k/32]`. `wq`: int8 quants widened to i32, `[rows * k]`.
 /// The decode (`wd * wq`) and the contraction are the exact math each backend hand-writes today.
-#[cube(launch_unchecked)]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn matvec_q8<F: Float>(
     wd: &Array<F>,
     wq: &Array<i32>,
@@ -54,8 +54,8 @@ pub fn matvec_q8_run<R: Runtime>(
     unsafe {
         matvec_q8::launch_unchecked::<f32, R>(
             client,
-            CubeCount::Static(grid, 1, 1),
-            CubeDim::new_1d(block),
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
             ArrayArg::from_raw_parts(wqh.clone(), wq.len()),
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
@@ -88,8 +88,8 @@ pub fn matvec_q8_bench<R: Runtime>(
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8::launch_unchecked::<f32, R>(
             c,
-            CubeCount::Static(grid, 1, 1),
-            CubeDim::new_1d(block),
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
             ArrayArg::from_raw_parts(wqh.clone(), wq.len()),
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
@@ -133,13 +133,13 @@ pub fn matvec_q8_ref(wd: &[f32], wq: &[i32], x: &[f32], rows: usize, k: usize) -
 // ============================================================================================
 pub const QK_K: usize = 256;
 
-#[cube]
+#[device]
 fn byte_at(a: &Array<u32>, base: usize, i: usize) -> u32 {
     (a[base + i / 4] >> ((8 * (i % 4)) as u32)) & 255
 }
 
 // get_scale_min_k4 scale component (llama.cpp), from the 12 packed scale bytes at scbase.
-#[cube]
+#[device]
 fn q4k_sc(wsc: &Array<u32>, scbase: usize, j: usize) -> u32 {
     let mut r = byte_at(wsc, scbase, j) & 63;
     if j >= 4 {
@@ -148,7 +148,7 @@ fn q4k_sc(wsc: &Array<u32>, scbase: usize, j: usize) -> u32 {
     r
 }
 // get_scale_min_k4 min component.
-#[cube]
+#[device]
 fn q4k_m(wsc: &Array<u32>, scbase: usize, j: usize) -> u32 {
     let mut r = byte_at(wsc, scbase, j + 4) & 63;
     if j >= 4 {
@@ -158,7 +158,7 @@ fn q4k_m(wsc: &Array<u32>, scbase: usize, j: usize) -> u32 {
 }
 
 /// Q4_K matvec, one invocation per output row. Bit-identical decode order to `BlockQ4K::to_float`.
-#[cube(launch_unchecked)]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn matvec_q4k<F: Float>(
     wqs: &Array<u32>,
     wsc: &Array<u32>,
@@ -213,7 +213,7 @@ pub fn matvec_q4k_run<R: Runtime>(
     let grid = (rows as u32).div_ceil(block);
     unsafe {
         matvec_q4k::launch_unchecked::<f32, R>(
-            client, CubeCount::Static(grid, 1, 1), CubeDim::new_1d(block),
+            client, Grid::Static(grid, 1, 1), Block::new_1d(block),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -240,7 +240,7 @@ pub fn matvec_q4k_bench<R: Runtime>(
     let grid = (rows as u32).div_ceil(block);
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q4k::launch_unchecked::<f32, R>(
-            c, CubeCount::Static(grid, 1, 1), CubeDim::new_1d(block),
+            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -318,7 +318,7 @@ pub fn gen_q4k(rows: usize, k: usize) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>
 // SPV_KHR_integer_dot_product), verified emitted. Integer activations (xq) so the int dot is exact;
 // out[row] = sum_block wd[block] * dot(qw_group, xq_group). Bit-exact vs matvec_q8_dp4a_ref.
 // ============================================================================================
-#[cube(launch_unchecked)]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn matvec_q8_dp4a<F: Float>(
     wq: &Array<Vector<i32, Const<4>>>, // int8 weights, grouped x4  [rows * k/4]
     xq: &Array<Vector<i32, Const<4>>>, // int activation, grouped x4 [k/4]
@@ -352,7 +352,7 @@ pub fn matvec_q8_dp4a_run<R: Runtime>(
     let ng = k / 4;
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8_dp4a::launch_unchecked::<f32, R>(
-            c, CubeCount::Static(grid, 1, 1), CubeDim::new_1d(block),
+            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
             ArrayArg::from_raw_parts(wqh.clone(), rows * ng),
             ArrayArg::from_raw_parts(xqh.clone(), ng),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
