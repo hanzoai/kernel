@@ -6,10 +6,43 @@
 
 use hanzo_kernel::prelude::*;
 use hanzo_kernel::quant::{
-    gen_q4k, matvec_q4k_bench, matvec_q4k_ref, matvec_q4k_run, matvec_q8_bench, matvec_q8_ref,
+    gen_q4k, matvec_q4k_bench, matvec_q4k_ref, matvec_q4k_run, matvec_q8_bench,
+    matvec_q8_dp4a_blk_run, matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref,
     matvec_q8_run, QK8_0,
 };
 use std::time::Instant;
+
+// dp4a matvec parity: i8-packed one-thread-per-row (portable) vs block-per-row (coalesced reads +
+// shared-mem reduction, the bandwidth-bound winner). GB/s is on REAL int8 bytes (rows*k) so it
+// compares fairly to the hand-tuned dp4a (~166 GB/s; gfx1151 DRAM roofline ~256, MALL cache ~32MB).
+// `coop` gates the block kernels: cubecl-cpu has no cooperative thread-blocks, so they run GPU-only.
+fn check_dp4a<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize, coop: bool) {
+    let mut s = 0x9E3779B9_7F4A7C15u64;
+    let mut nxt = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let wq8: Vec<i8> = (0..rows * k).map(|_| (nxt() % 255) as i8).collect();
+    let xq8: Vec<i8> = (0..k).map(|_| (nxt() % 255) as i8).collect();
+    let wd: Vec<f32> = (0..rows * k / 32).map(|_| (nxt() % 1000) as f32 / 8000.0 + 0.01).collect();
+    let wq32: Vec<i32> = wq8.iter().map(|&x| x as i32).collect();
+    let xq32: Vec<i32> = xq8.iter().map(|&x| x as i32).collect();
+    let reference = matvec_q8_dp4a_ref(&wq32, &xq32, &wd, rows, k);
+    let real_bytes = (rows * k) as f64; // int8 weights, 1 byte each -- the hand-tuned footprint
+    let flop = 2.0 * rows as f64 * k as f64;
+    let mut report = |tag: &str, (out, ms): (Vec<f32>, f64)| {
+        let rel = max_rel(&reference, &out);
+        println!(
+            "[{:<7}] dp4a/{:<6} {}x{}  max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
+            name, tag, rows, k, rel,
+            if rel < 2e-2 { "MATCH ✓" } else { "MISMATCH ✗" },
+            ms, real_bytes / (ms * 1e6), flop / (ms * 1e6)
+        );
+    };
+    report("i8pack", matvec_q8_dp4a_i8_run(client, &wq8, &xq8, &wd, rows, k, 50));
+    if coop {
+        for nt in [64usize, 128, 256] {
+            report(&format!("blk{nt}"), matvec_q8_dp4a_blk_run(client, &wq8, &xq8, &wd, rows, k, nt, 50));
+        }
+    }
+}
 
 fn maxrel(a: &[f32], b: &[f32]) -> f32 {
     let mut m = 0f32;
@@ -100,6 +133,7 @@ fn main() {
         check::<CpuRuntime>("CPU", &c, rows, k);
         check::<CpuRuntime>("CPU/ctrl", &c, rows, ctrl);
         check_q4k::<CpuRuntime>("CPU", &c, rows, k);
+        check_dp4a::<CpuRuntime>("CPU", &c, rows, k, false); // cubecl-cpu: no cooperative blocks
     }
     #[cfg(feature = "vulkan")]
     {
@@ -108,20 +142,31 @@ fn main() {
         check::<WgpuRuntime>("VULKAN", &c, rows, k);
         check::<WgpuRuntime>("VK/ctrl", &c, rows, ctrl);
         check_q4k::<WgpuRuntime>("VULKAN", &c, rows, k);
+        check_dp4a::<WgpuRuntime>("VULKAN", &c, rows, k, true);
+        check_dp4a::<WgpuRuntime>("VK/big", &c, 8192, 8192, true); // 67MB weights: cache-busting BW
     }
     #[cfg(feature = "metal")]
     {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-        check::<WgpuRuntime>("METAL", &WgpuRuntime::client(&WgpuDevice::default()), rows, k);
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        check::<WgpuRuntime>("METAL", &c, rows, k);
+        check_q4k::<WgpuRuntime>("METAL", &c, rows, k);
+        check_dp4a::<WgpuRuntime>("METAL", &c, rows, k, true);
     }
     #[cfg(feature = "cuda")]
     {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
-        check::<CudaRuntime>("CUDA", &CudaRuntime::client(&CudaDevice::default()), rows, k);
+        let c = CudaRuntime::client(&CudaDevice::default());
+        check::<CudaRuntime>("CUDA", &c, rows, k);
+        check_q4k::<CudaRuntime>("CUDA", &c, rows, k);
+        check_dp4a::<CudaRuntime>("CUDA", &c, rows, k, true);
     }
     #[cfg(feature = "rocm")]
     {
         use cubecl::hip::{HipDevice, HipRuntime};
-        check::<HipRuntime>("ROCM", &HipRuntime::client(&HipDevice::default()), rows, k);
+        let c = HipRuntime::client(&HipDevice::default());
+        check::<HipRuntime>("ROCM", &c, rows, k);
+        check_q4k::<HipRuntime>("ROCM", &c, rows, k);
+        check_dp4a::<HipRuntime>("ROCM", &c, rows, k, true);
     }
 }

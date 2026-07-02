@@ -380,3 +380,141 @@ pub fn matvec_q8_dp4a_ref(wq: &[i32], xq: &[i32], wd: &[f32], rows: usize, k: us
         acc
     }).collect()
 }
+
+// ============================================================================================
+// PACKED dp4a matvec: weights stored as Vector<i8,4> (4 BYTES/group -- the real int8 footprint,
+// vs the i32x4 kernel's 16 bytes), cast to Vector<i32,4> in-register (lane-wise sign-extend), then
+// .dot() -> OpSDot. Same hardware dp4a, 4x less weight memory traffic. Matvec is weight-bandwidth-
+// bound, so this is THE lever toward hand-tuned parity. Bit-exact vs matvec_q8_dp4a_ref.
+// ============================================================================================
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn matvec_q8_dp4a_i8<F: Float>(
+    wq: &Array<Vector<i8, Const<4>>>, // int8 weights, packed x4  [rows * k/4], 4 bytes/group
+    xq: &Array<Vector<i8, Const<4>>>, // int8 activation, packed x4 [k/4]
+    wd: &Array<F>,                    // per-32-block scale         [rows * k/32]
+    out: &mut Array<F>,
+    #[comptime] k: usize,
+) {
+    let row = ABSOLUTE_POS;
+    if row < out.len() {
+        let ng = k / 4;
+        let nb = k / 32;
+        let wbase = row * ng;
+        let dbase = row * nb;
+        let mut acc = F::new(0.0);
+        for g in 0..ng {
+            let wi = Vector::<i32, Const<4>>::cast_from(wq[wbase + g]);
+            let xi = Vector::<i32, Const<4>>::cast_from(xq[g]);
+            let dp = wi.dot(xi); // OpSDot on the widened i32x4 (loaded from 4-byte packed int8)
+            acc += wd[dbase + g / 8] * F::cast_from(dp);
+        }
+        out[row] = acc;
+    }
+}
+
+/// Host for the packed-int8 dp4a matvec. Weights + activation are real int8 (`&[i8]`), 4 bytes/group.
+pub fn matvec_q8_dp4a_i8_run<R: Runtime>(
+    client: &ComputeClient<R>, wq: &[i8], xq: &[i8], wd: &[f32], rows: usize, k: usize, bench_iters: usize,
+) -> (Vec<f32>, f64) {
+    let wqh = client.create_from_slice(i8::as_bytes(wq));
+    let xqh = client.create_from_slice(i8::as_bytes(xq));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    let block = 64u32; let grid = (rows as u32).div_ceil(block);
+    let ng = k / 4;
+    let launch = |c: &ComputeClient<R>| unsafe {
+        matvec_q8_dp4a_i8::launch_unchecked::<f32, R>(
+            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            ArrayArg::from_raw_parts(wqh.clone(), rows * ng),
+            ArrayArg::from_raw_parts(xqh.clone(), ng),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(oh.clone(), rows),
+            k,
+        );
+    };
+    launch(client);
+    let bytes = client.read_one_unchecked(oh.clone());
+    let out = f32::from_bytes(&bytes).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..bench_iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / bench_iters as f64;
+    (out, ms)
+}
+
+// ============================================================================================
+// BLOCK-per-row dp4a matvec: the bandwidth-bound pattern. One thread block owns one output row;
+// its `nt` threads stride over the k/4 groups so ADJACENT threads read ADJACENT Vector<i8,4>
+// (consecutive 4-byte loads -> coalesced 256B transactions), vs the one-thread-per-row kernel whose
+// adjacent threads are a whole row (k/4 groups) apart -> uncoalesced. Partials are tree-reduced in
+// shared memory. This is what takes the DSL dp4a from latency-bound to weight-bandwidth-bound.
+// ============================================================================================
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn matvec_q8_dp4a_blk<F: Float>(
+    wq: &Array<Vector<i8, Const<4>>>, // int8 weights, packed x4  [rows * k/4]
+    xq: &Array<Vector<i8, Const<4>>>, // int8 activation, packed x4 [k/4]
+    wd: &Array<F>,                    // per-32-block scale         [rows * k/32]
+    out: &mut Array<F>,
+    #[comptime] k: usize,
+    #[comptime] nt: usize, // threads per block (one block per row)
+) {
+    let row = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let ng = k / 4;
+    let wbase = row * ng;
+    let dbase = row * (k / 32);
+    let mut partial = F::new(0.0);
+    let per = ng / nt; // groups per thread (ng is a multiple of nt); bounded for-loop lowers cleanly
+    for j in 0..per {
+        let g = j * nt + t;
+        let wi = Vector::<i32, Const<4>>::cast_from(wq[wbase + g]);
+        let xi = Vector::<i32, Const<4>>::cast_from(xq[g]);
+        partial += wd[dbase + g / 8] * F::cast_from(wi.dot(xi)); // OpSDot per group
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2; // runtime (== nt); a comptime `nt/2` can't be mutated (RuntimeCell)
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 { out[row] = smem[0]; }
+}
+
+/// Host for the block-per-row dp4a matvec. `nt` threads cooperate per row (coalesced + reduced).
+pub fn matvec_q8_dp4a_blk_run<R: Runtime>(
+    client: &ComputeClient<R>, wq: &[i8], xq: &[i8], wd: &[f32], rows: usize, k: usize, nt: usize, bench_iters: usize,
+) -> (Vec<f32>, f64) {
+    let wqh = client.create_from_slice(i8::as_bytes(wq));
+    let xqh = client.create_from_slice(i8::as_bytes(xq));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    let ng = k / 4;
+    let launch = |c: &ComputeClient<R>| unsafe {
+        matvec_q8_dp4a_blk::launch_unchecked::<f32, R>(
+            c, Grid::Static(rows as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wqh.clone(), rows * ng),
+            ArrayArg::from_raw_parts(xqh.clone(), ng),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(oh.clone(), rows),
+            k, nt,
+        );
+    };
+    launch(client);
+    let bytes = client.read_one_unchecked(oh.clone());
+    let out = f32::from_bytes(&bytes).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..bench_iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / bench_iters as f64;
+    (out, ms)
+}
