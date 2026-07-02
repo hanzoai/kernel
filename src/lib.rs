@@ -43,3 +43,7 @@ pub mod prelude {
 pub use cubecl;
 
 pub mod quant;
+
+pub mod norm;
+pub mod rope;
+pub mod attn;
