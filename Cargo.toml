@@ -3,6 +3,10 @@ name = "hanzo-kernel"
 version = "0.1.0"
 edition = "2021"
 description = "Hanzo's first-party GPU kernel DSL: one Rust source, lowered to CUDA/ROCm/Vulkan/Metal."
+license = "BSD-3-Clause"
+repository = "https://github.com/hanzoai/ml"
+keywords = ["gpu", "kernel", "cuda", "vulkan", "metal"]
+categories = ["hardware-support", "science"]
 
 [dependencies]
 # CubeCL is the lowering engine (the value); hanzo-kernel is the namespace (the place).
