@@ -156,6 +156,7 @@ mod tests {
         assert!(rel < 2e-3, "rope {tag} max_rel {rel}");
     }
 
+    #[cfg(feature = "cpu")]
     #[test]
     fn rope_cpu_bit_exact() {
         use cubecl::cpu::{CpuDevice, CpuRuntime};
