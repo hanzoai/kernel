@@ -312,3 +312,71 @@ pub fn gen_q4k(rows: usize, k: usize) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>
     let x: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
     (wqs, wsc, wd, wdm, x)
 }
+
+// ============================================================================================
+// dp4a matvec: the inner product uses Vector<i32,4>.dot -> SPIR-V OpSDot (hardware integer dot,
+// SPV_KHR_integer_dot_product), verified emitted. Integer activations (xq) so the int dot is exact;
+// out[row] = sum_block wd[block] * dot(qw_group, xq_group). Bit-exact vs matvec_q8_dp4a_ref.
+// ============================================================================================
+#[cube(launch_unchecked)]
+pub fn matvec_q8_dp4a<F: Float>(
+    wq: &Array<Vector<i32, Const<4>>>, // int8 weights, grouped x4  [rows * k/4]
+    xq: &Array<Vector<i32, Const<4>>>, // int activation, grouped x4 [k/4]
+    wd: &Array<F>,                     // per-32-block scale         [rows * k/32]
+    out: &mut Array<F>,
+    #[comptime] k: usize,
+) {
+    let row = ABSOLUTE_POS;
+    if row < out.len() {
+        let ng = k / 4;
+        let nb = k / 32;
+        let wbase = row * ng;
+        let dbase = row * nb;
+        let mut acc = F::new(0.0);
+        for g in 0..ng {
+            let dp = wq[wbase + g].dot(xq[g]); // OpSDot: 4 int8*int products -> i32
+            acc += wd[dbase + g / 8] * F::cast_from(dp);
+        }
+        out[row] = acc;
+    }
+}
+
+pub fn matvec_q8_dp4a_run<R: Runtime>(
+    client: &ComputeClient<R>, wq: &[i32], xq: &[i32], wd: &[f32], rows: usize, k: usize, bench_iters: usize,
+) -> (Vec<f32>, f64) {
+    let wqh = client.create_from_slice(i32::as_bytes(wq));
+    let xqh = client.create_from_slice(i32::as_bytes(xq));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    let block = 64u32; let grid = (rows as u32).div_ceil(block);
+    let ng = k / 4;
+    let launch = |c: &ComputeClient<R>| unsafe {
+        matvec_q8_dp4a::launch_unchecked::<f32, R>(
+            c, CubeCount::Static(grid, 1, 1), CubeDim::new_1d(block),
+            ArrayArg::from_raw_parts(wqh.clone(), rows * ng),
+            ArrayArg::from_raw_parts(xqh.clone(), ng),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(oh.clone(), rows),
+            k,
+        );
+    };
+    launch(client);
+    let bytes = client.read_one_unchecked(oh.clone());
+    let out = f32::from_bytes(&bytes).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..bench_iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / bench_iters as f64;
+    (out, ms)
+}
+
+pub fn matvec_q8_dp4a_ref(wq: &[i32], xq: &[i32], wd: &[f32], rows: usize, k: usize) -> Vec<f32> {
+    let nb = k / 32;
+    (0..rows).map(|row| {
+        let mut acc = 0.0f32;
+        for i in 0..k { acc += wd[row * nb + i / 32] * (wq[row * k + i] * xq[i]) as f32; }
+        acc
+    }).collect()
+}
