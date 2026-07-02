@@ -31,6 +31,54 @@ pub fn rms_norm<F: Float>(
     }
 }
 
+/// Block-per-row RMSNorm: `nt` threads cooperate on one row -- COALESCED reads (adjacent threads hit
+/// adjacent addresses) + shared-mem tree reduction. The memory-bound win over one-thread-per-row (each
+/// thread strides a full row, uncoalesced) is large, and it stays fast at low row counts (decode, rows=1).
+/// Same shape as `quant::matvec_q8_dp4a_blk`. Block kernels are GPU-only (cubecl-cpu has no cooperative blocks).
+///
+/// `n` (the normalized dim) is RUNTIME (`ndim[0]`), so one compiled kernel is a drop-in for every model's
+/// hidden size and any row width -- no per-dim specialization, no `n % nt == 0` requirement (strided guard).
+/// Only `nt` (the block/shared-mem size) is comptime, because shared memory is statically sized.
+#[kernel(targets(cuda, metal, vulkan, webgpu), unchecked)]
+pub fn rms_norm_blk<F: Float>(
+    x: &Array<F>,
+    w: &Array<F>,
+    out: &mut Array<F>,
+    eps: &Array<F>,
+    ndim: &Array<u32>,     // ndim[0] = n; runtime so the kernel is dim-agnostic
+    #[comptime] nt: usize, // threads per block (one block per row); shared-mem size
+) {
+    let n = ndim[0] as usize;
+    let base = CUBE_POS as usize * n;
+    let step = CUBE_DIM as usize;
+    let t = UNIT_POS as usize;
+    let mut partial = F::new(0.0);
+    let mut idx = t; // seed from a runtime builtin (comptime consts can't be mutated)
+    while idx < n {
+        let v = x[base + idx];
+        partial += v * v;
+        idx += step;
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let denom = (smem[0] / F::cast_from(n as u32) + eps[0]).sqrt();
+    let mut o = t;
+    while o < n {
+        out[base + o] = x[base + o] / denom * w[o];
+        o += step;
+    }
+}
+
 /// LayerNorm over the last dim: `out[i] = (x[i] - mean) / sqrt(var + eps) * w[i] + b[i]`, per row of `n`.
 #[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn layer_norm<F: Float>(
@@ -90,6 +138,80 @@ pub fn rms_norm_run<R: Runtime>(
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Host launch for the block-per-row RMSNorm: one block per row, `nt` cooperating threads.
+pub fn rms_norm_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+    nt: usize,
+) -> Vec<f32> {
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let wh = client.create_from_slice(f32::as_bytes(w));
+    let eph = client.create_from_slice(f32::as_bytes(&[eps]));
+    let ndh = client.create_from_slice(u32::as_bytes(&[n as u32]));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows * n]));
+    unsafe {
+        rms_norm_blk::launch_unchecked::<f32, R>(
+            client,
+            Grid::Static(rows as u32, 1, 1),
+            Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(oh.clone(), rows * n),
+            ArrayArg::from_raw_parts(eph.clone(), 1),
+            ArrayArg::from_raw_parts(ndh.clone(), 1),
+            nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Kernel-only timing (ms/dispatch) for the block RMSNorm -- reads the output handle to force
+/// completion, matching `quant::matvec_q8_dp4a_blk_run`. Returns (output, ms/dispatch).
+pub fn rms_norm_blk_bench<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+    nt: usize,
+    iters: usize,
+) -> (Vec<f32>, f64) {
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let wh = client.create_from_slice(f32::as_bytes(w));
+    let eph = client.create_from_slice(f32::as_bytes(&[eps]));
+    let ndh = client.create_from_slice(u32::as_bytes(&[n as u32]));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows * n]));
+    let launch = |c: &ComputeClient<R>| unsafe {
+        rms_norm_blk::launch_unchecked::<f32, R>(
+            c,
+            Grid::Static(rows as u32, 1, 1),
+            Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(oh.clone(), rows * n),
+            ArrayArg::from_raw_parts(eph.clone(), 1),
+            ArrayArg::from_raw_parts(ndh.clone(), 1),
+            nt,
+        );
+    };
+    for _ in 0..3 {
+        launch(client);
+    }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(client);
+    }
+    let out = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    (f32::from_bytes(&out).to_vec(), ms)
 }
 
 /// Host launch for LayerNorm.
@@ -207,6 +329,31 @@ mod tests {
         let rel = max_rel(&want, &got);
         eprintln!("[layer_norm CPU] {rows}x{n} max_rel={rel:.2e}");
         assert!(rel < 2e-3, "layer_norm max_rel {rel}");
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn rms_norm_blk_vulkan_bit_exact_and_bench() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let (rows, n, nt) = (4096usize, 4096usize, 256usize); // 67MB x -> cache-busting on gfx1151 MALL
+        let (x, w, _) = data(rows, n);
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        // bit-exact vs the CPU oracle (block tree-reduction reorders the sum -> f32 tol)
+        let want = rms_norm_ref(&x, &w, rows, n, EPS);
+        let (got, ms) = rms_norm_blk_bench::<WgpuRuntime>(&c, &x, &w, rows, n, EPS, nt, 50);
+        let rel = max_rel(&want, &got);
+        let bytes = (2 * rows * n + n) as f64 * 4.0; // read x + write out (+w)
+        let gbps = bytes / (ms * 1e6);
+        eprintln!("[rms_norm_blk VULKAN] {rows}x{n} nt={nt}  max_rel={rel:.2e}  {ms:.3} ms  {gbps:.0} GB/s");
+        assert!(rel < 2e-3, "rms_norm_blk max_rel {rel}");
+        // dim-agnostic: n not a multiple of nt, and n < nt -- the strided guard must still be exact
+        for &m in &[130usize, 1536, 3072] {
+            let (xx, ww, _) = data(11, m);
+            let g = rms_norm_blk_run::<WgpuRuntime>(&c, &xx, &ww, 11, m, EPS, 256);
+            let r = max_rel(&rms_norm_ref(&xx, &ww, 11, m, EPS), &g);
+            eprintln!("[rms_norm_blk VULKAN] 11x{m} (n%nt!=0)  max_rel={r:.2e}");
+            assert!(r < 2e-3, "rms_norm_blk n={m} max_rel {r}");
+        }
     }
 
     #[cfg(feature = "metal")]
