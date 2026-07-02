@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-kernel"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Hanzo's first-party GPU kernel DSL: one Rust source, lowered to CUDA/ROCm/Vulkan/Metal."
 license = "BSD-3-Clause"
@@ -31,3 +31,4 @@ path = "src/main.rs"
 [[bin]]
 name = "dp4a-probe"
 path = "src/dp4a_probe.rs"
+required-features = ["vulkan"]
