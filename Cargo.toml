@@ -8,6 +8,7 @@ description = "Hanzo's first-party GPU kernel DSL: one Rust source, lowered to C
 # CubeCL is the lowering engine (the value); hanzo-kernel is the namespace (the place).
 # Kernel source only ever names `hanzo_kernel::*` -- `cubecl` appears nowhere but this manifest.
 cubecl = { version = "0.10", default-features = false }
+half = "2"
 
 [features]
 default = ["cpu"]
