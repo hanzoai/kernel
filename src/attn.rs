@@ -184,6 +184,7 @@ mod tests {
         assert!(rel < 2e-3, "sdpa {tag} max_rel {rel}");
     }
 
+    #[cfg(feature = "cpu")]
     #[test]
     fn sdpa_cpu_bit_exact() {
         use cubecl::cpu::{CpuDevice, CpuRuntime};

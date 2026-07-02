@@ -181,6 +181,7 @@ mod tests {
         (x, w, b)
     }
 
+    #[cfg(feature = "cpu")]
     #[test]
     fn rms_norm_cpu_bit_exact() {
         use cubecl::cpu::{CpuDevice, CpuRuntime};
@@ -194,6 +195,7 @@ mod tests {
         assert!(rel < 2e-3, "rms_norm max_rel {rel}");
     }
 
+    #[cfg(feature = "cpu")]
     #[test]
     fn layer_norm_cpu_bit_exact() {
         use cubecl::cpu::{CpuDevice, CpuRuntime};
