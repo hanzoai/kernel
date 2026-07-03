@@ -7,7 +7,7 @@
 use hanzo_kernel::prelude::*;
 use hanzo_kernel::quant::{
     gen_q4k, gen_q8_0_packed, matvec_q4k_bench, matvec_q4k_ref, matvec_q4k_run,
-    matvec_q8_0_packed_ref, matvec_q8_0_packed_run, matvec_q8_bench, matvec_q8_dp4a_blk_run,
+    matvec_q8_0_packed_ref, matvec_q8_0_packed_run, matvec_q8_0_packed_sg_run, matvec_q8_bench, matvec_q8_dp4a_blk_run,
     matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref, matvec_q8_run, QK8_0,
 };
 use std::time::Instant;
@@ -113,6 +113,22 @@ fn check_q8_0_packed<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: us
     );
 }
 
+// Subgroup (plane_sum, no shared-mem) Q8_0 packed matvec -- mirrors production mul_mat_vec_q8_sg.
+// nt MUST be the hardware plane size; a wrong plane size drops cross-plane partials -> bit-exact catches it.
+fn check_q8_0_packed_sg<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize, nt: usize) {
+    let (w, x) = gen_q8_0_packed(rows, k);
+    let reference = matvec_q8_0_packed_ref(&w, &x, rows, k);
+    let (out, ms) = matvec_q8_0_packed_sg_run::<R>(client, &w, &x, rows, k, nt, 50);
+    let rel = max_rel(&reference, &out);
+    let wbytes = rows * (k / 32) * 34;
+    let gbps = wbytes as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] Q8_0sg {}x{} nt={:<3} max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s",
+        name, rows, k, nt, rel,
+        if rel < 3e-3 { "BIT-EXACT ✓" } else { "MISMATCH ✗ (plane!=nt?)" }, ms, gbps
+    );
+}
+
 fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize) {
     let (wd, wq, x) = gen(rows, k);
     let reference = matvec_q8_ref(&wd, &wq, &x, rows, k);
@@ -163,6 +179,10 @@ fn main() {
         check_dp4a::<WgpuRuntime>("VK/big", &c, 8192, 8192, true); // 67MB weights: cache-busting BW
         check_q8_0_packed::<WgpuRuntime>("VULKAN", &c, rows, k, 64);
         check_q8_0_packed::<WgpuRuntime>("VK/big", &c, 8192, 8192, 128); // cache-busting Q8_0 BW
+        // subgroup variant: nt MUST equal the hardware plane size (bit-exact fails otherwise). Try 32/64.
+        check_q8_0_packed_sg::<WgpuRuntime>("VK/sg32", &c, rows, k, 32);
+        check_q8_0_packed_sg::<WgpuRuntime>("VK/sg64", &c, rows, k, 64);
+        check_q8_0_packed_sg::<WgpuRuntime>("VK/sgBIG", &c, 8192, 8192, 32);
     }
     #[cfg(feature = "metal")]
     {
