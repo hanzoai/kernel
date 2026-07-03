@@ -6,9 +6,9 @@
 
 use hanzo_kernel::prelude::*;
 use hanzo_kernel::quant::{
-    gen_q4k, matvec_q4k_bench, matvec_q4k_ref, matvec_q4k_run, matvec_q8_bench,
-    matvec_q8_dp4a_blk_run, matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref,
-    matvec_q8_run, QK8_0,
+    gen_q4k, gen_q8_0_packed, matvec_q4k_bench, matvec_q4k_ref, matvec_q4k_run,
+    matvec_q8_0_packed_ref, matvec_q8_0_packed_run, matvec_q8_bench, matvec_q8_dp4a_blk_run,
+    matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref, matvec_q8_run, QK8_0,
 };
 use std::time::Instant;
 
@@ -96,6 +96,23 @@ fn max_rel(a: &[f32], b: &[f32]) -> f32 {
     m
 }
 
+// Q8_0 PACKED: the production-layout matvec (9 u32/block, in-kernel fp16+int8 decode). Bit-exact vs
+// the CPU oracle + real weight-bandwidth (packed bytes = rows * k/32 * 34, the true Q8_0 footprint).
+fn check_q8_0_packed<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize, nt: usize) {
+    let (w, x) = gen_q8_0_packed(rows, k);
+    let reference = matvec_q8_0_packed_ref(&w, &x, rows, k);
+    let (out, ms) = matvec_q8_0_packed_run::<R>(client, &w, &x, rows, k, nt, 50);
+    let rel = max_rel(&reference, &out);
+    let wbytes = rows * (k / 32) * 34; // real Q8_0: 34 bytes/block (fp16 scale + 32 int8)
+    let gbps = wbytes as f64 / (ms * 1e6);
+    let gflops = 2.0 * rows as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] Q8_0pk {}x{} nt={:<3} max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
+        name, rows, k, nt, rel,
+        if rel < 3e-3 { "BIT-EXACT ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+    );
+}
+
 fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize) {
     let (wd, wq, x) = gen(rows, k);
     let reference = matvec_q8_ref(&wd, &wq, &x, rows, k);
@@ -144,6 +161,8 @@ fn main() {
         check_q4k::<WgpuRuntime>("VULKAN", &c, rows, k);
         check_dp4a::<WgpuRuntime>("VULKAN", &c, rows, k, true);
         check_dp4a::<WgpuRuntime>("VK/big", &c, 8192, 8192, true); // 67MB weights: cache-busting BW
+        check_q8_0_packed::<WgpuRuntime>("VULKAN", &c, rows, k, 64);
+        check_q8_0_packed::<WgpuRuntime>("VK/big", &c, 8192, 8192, 128); // cache-busting Q8_0 BW
     }
     #[cfg(feature = "metal")]
     {
