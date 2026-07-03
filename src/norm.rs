@@ -365,9 +365,11 @@ mod tests {
         let c = WgpuRuntime::client(&WgpuDevice::default());
         let r = rms_norm_run::<WgpuRuntime>(&c, &x, &w, rows, n, EPS);
         let l = layer_norm_run::<WgpuRuntime>(&c, &x, &w, &b, rows, n, EPS);
+        let blk = rms_norm_blk_run::<WgpuRuntime>(&c, &x, &w, rows, n, EPS, n);
         let rr = max_rel(&rms_norm_ref(&x, &w, rows, n, EPS), &r);
         let lr = max_rel(&layer_norm_ref(&x, &w, &b, rows, n, EPS), &l);
-        eprintln!("[rms_norm  METAL] max_rel={rr:.2e}  [layer_norm METAL] max_rel={lr:.2e}");
-        assert!(rr < 2e-3 && lr < 2e-3);
+        let br = max_rel(&rms_norm_ref(&x, &w, rows, n, EPS), &blk);
+        eprintln!("[rms_norm METAL] {rr:.2e}  [layer_norm METAL] {lr:.2e}  [rms_norm_blk METAL] {br:.2e}");
+        assert!(rr < 2e-3 && lr < 2e-3 && br < 2e-3);
     }
 }
