@@ -524,6 +524,46 @@ pub fn matvec_q8_0_packed_blk<F: Float>(
     }
 }
 
+// Subgroup variant: one plane per row, plane_sum reduction (NO shared mem) -- mirrors production
+// mul_mat_vec_q8_sg. `nt` MUST equal the hardware plane/subgroup size so the block is exactly one plane
+// (else plane_sum reduces only within a plane and cross-plane partials are dropped -> caller sets
+// nt = client plane size, and the bit-exact gate catches a mismatch).
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn matvec_q8_0_packed_sg<F: Float>(
+    w: &Array<u32>,
+    x: &Array<F>,
+    out: &mut Array<F>,
+    #[comptime] k: usize,
+    #[comptime] nt: usize, // = plane size (one plane per row)
+) {
+    let row = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let nblocks = k / 32;
+    let wbase = row * nblocks * 9;
+    let per = nblocks / nt;
+    let mut partial = F::new(0.0);
+    for j in 0..per {
+        let b = j * nt + t;
+        let off = wbase + b * 9;
+        let scale = F::cast_from(f16lo_to_f32(w[off]));
+        let xb = b * 32;
+        let mut bsum = F::new(0.0);
+        for jj in 0..8 {
+            let word = w[off + 1 + jj];
+            let xo = xb + jj * 4;
+            bsum += i8lane::<F>(word, 0) * x[xo];
+            bsum += i8lane::<F>(word, 8) * x[xo + 1];
+            bsum += i8lane::<F>(word, 16) * x[xo + 2];
+            bsum += i8lane::<F>(word, 24) * x[xo + 3];
+        }
+        partial += scale * bsum;
+    }
+    let total = plane_sum(partial);
+    if t == 0 {
+        out[row] = total;
+    }
+}
+
 // CPU oracle: decode packed Q8_0 exactly (half::f16 from low 16 bits, signed int8) and dot with f32 x.
 pub fn matvec_q8_0_packed_ref(w: &[u32], x: &[f32], rows: usize, k: usize) -> Vec<f32> {
     let nblocks = k / 32;
@@ -587,6 +627,34 @@ pub fn matvec_q8_0_packed_run<R: Runtime>(
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8_0_packed_blk::launch_unchecked::<f32, R>(
+            c, Grid::Static(rows as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(xh.clone(), k),
+            ArrayArg::from_raw_parts(oh.clone(), rows),
+            k, nt,
+        );
+    };
+    launch(client);
+    let bytes = client.read_one_unchecked(oh.clone());
+    let out = f32::from_bytes(&bytes).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..bench_iters { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let ms = t.elapsed().as_secs_f64() * 1000.0 / bench_iters as f64;
+    (out, ms)
+}
+
+// Subgroup variant runner: block = one plane (nt = plane size). pipelined (throughput) timing.
+pub fn matvec_q8_0_packed_sg_run<R: Runtime>(
+    client: &ComputeClient<R>, w: &[u32], x: &[f32], rows: usize, k: usize, nt: usize, bench_iters: usize,
+) -> (Vec<f32>, f64) {
+    let wh = client.create_from_slice(u32::as_bytes(w));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    let launch = |c: &ComputeClient<R>| unsafe {
+        matvec_q8_0_packed_sg::launch_unchecked::<f32, R>(
             c, Grid::Static(rows as u32, 1, 1), Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(wh.clone(), w.len()),
             ArrayArg::from_raw_parts(xh.clone(), k),
