@@ -79,6 +79,55 @@ pub fn rms_norm_blk<F: Float>(
     }
 }
 
+/// Fused residual-add + RMSNorm, block-per-row (coalesced + shared-mem reduction). Emits BOTH
+/// `s = x + res` and `y = s / sqrt(mean(s^2) + eps) * alpha` in one dispatch -- bit-identical to
+/// `add.comp` then `rms_norm.comp` (same f32 ops, same order), the coalesced twin of the naive
+/// per-row `add_rmsnorm.comp`. GPU-only (cubecl-cpu has no cooperative blocks).
+#[kernel(targets(cuda, metal, vulkan, webgpu), unchecked)]
+pub fn add_rmsnorm_blk<F: Float>(
+    x: &Array<F>,
+    res: &Array<F>,
+    alpha: &Array<F>,
+    s_out: &mut Array<F>,
+    y: &mut Array<F>,
+    eps: &Array<F>,
+    ndim: &Array<u32>,     // ndim[0] = n; runtime so the kernel is dim-agnostic
+    #[comptime] nt: usize, // threads per block (one block per row); shared-mem size
+) {
+    let n = ndim[0] as usize;
+    let base = CUBE_POS as usize * n;
+    let step = CUBE_DIM as usize;
+    let t = UNIT_POS as usize;
+    // Pass 1: write the summed residual stream and accumulate sum-of-squares.
+    let mut partial = F::new(0.0);
+    let mut idx = t;
+    while idx < n {
+        let v = x[base + idx] + res[base + idx];
+        s_out[base + idx] = v;
+        partial += v * v;
+        idx += step;
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let denom = (smem[0] / F::cast_from(n as u32) + eps[0]).sqrt();
+    // Pass 2: normalize. Recompute (x+res) (bit-identical to s_out, avoids reading a writeonly buffer).
+    let mut o = t;
+    while o < n {
+        y[base + o] = (x[base + o] + res[base + o]) / denom * alpha[o];
+        o += step;
+    }
+}
+
 /// LayerNorm over the last dim: `out[i] = (x[i] - mean) / sqrt(var + eps) * w[i] + b[i]`, per row of `n`.
 #[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn layer_norm<F: Float>(
@@ -261,6 +310,71 @@ pub fn rms_norm_ref(x: &[f32], w: &[f32], rows: usize, n: usize, eps: f32) -> Ve
     out
 }
 
+/// CPU oracle for fused add+RMSNorm: returns `(s = x+res, y = rms_norm(s)*alpha)`.
+pub fn add_rmsnorm_ref(
+    x: &[f32],
+    res: &[f32],
+    alpha: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut s = vec![0.0f32; rows * n];
+    let mut y = vec![0.0f32; rows * n];
+    for row in 0..rows {
+        let base = row * n;
+        let mut ss = 0.0f32;
+        for i in 0..n {
+            let v = x[base + i] + res[base + i];
+            s[base + i] = v;
+            ss += v * v;
+        }
+        let denom = (ss / n as f32 + eps).sqrt();
+        for i in 0..n {
+            y[base + i] = (x[base + i] + res[base + i]) / denom * alpha[i];
+        }
+    }
+    (s, y)
+}
+
+/// Host launch for the block add+RMSNorm (GPU-only). Returns `(s, y)`.
+pub fn add_rmsnorm_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[f32],
+    res: &[f32],
+    alpha: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+    nt: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let rh = client.create_from_slice(f32::as_bytes(res));
+    let ah = client.create_from_slice(f32::as_bytes(alpha));
+    let eph = client.create_from_slice(f32::as_bytes(&[eps]));
+    let ndh = client.create_from_slice(u32::as_bytes(&[n as u32]));
+    let sh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows * n]));
+    let yh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows * n]));
+    unsafe {
+        add_rmsnorm_blk::launch_unchecked::<f32, R>(
+            client,
+            Grid::Static(rows as u32, 1, 1),
+            Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(rh.clone(), res.len()),
+            ArrayArg::from_raw_parts(ah.clone(), alpha.len()),
+            ArrayArg::from_raw_parts(sh.clone(), rows * n),
+            ArrayArg::from_raw_parts(yh.clone(), rows * n),
+            ArrayArg::from_raw_parts(eph.clone(), 1),
+            ArrayArg::from_raw_parts(ndh.clone(), 1),
+            nt,
+        );
+    }
+    let s = f32::from_bytes(&client.read_one_unchecked(sh)).to_vec();
+    let y = f32::from_bytes(&client.read_one_unchecked(yh)).to_vec();
+    (s, y)
+}
+
 /// CPU oracle for LayerNorm.
 pub fn layer_norm_ref(x: &[f32], w: &[f32], b: &[f32], rows: usize, n: usize, eps: f32) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * n];
@@ -353,6 +467,35 @@ mod tests {
             let r = max_rel(&rms_norm_ref(&xx, &ww, 11, m, EPS), &g);
             eprintln!("[rms_norm_blk VULKAN] 11x{m} (n%nt!=0)  max_rel={r:.2e}");
             assert!(r < 2e-3, "rms_norm_blk n={m} max_rel {r}");
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn add_rmsnorm_blk_vulkan_bit_exact() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        // distinct residual stream (different seed) so s = x+res is a real add, not a doubling
+        let gen_res = |rows: usize, n: usize| -> Vec<f32> {
+            let mut s = 0x9E3779B9_7F4A7C15u64;
+            (0..rows * n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s % 2000) as f32 / 1000.0 - 1.0
+                })
+                .collect()
+        };
+        // 4096^2 cache-busting + dim-agnostic shapes (n%nt!=0, n<nt)
+        for &(rows, n, nt) in &[(4096usize, 4096usize, 256usize), (11, 130, 256), (11, 1536, 256), (7, 3072, 256)] {
+            let (x, alpha, _) = data(rows, n);
+            let res = gen_res(rows, n);
+            let (ws, wy) = add_rmsnorm_ref(&x, &res, &alpha, rows, n, EPS);
+            let (gs, gy) = add_rmsnorm_blk_run::<WgpuRuntime>(&c, &x, &res, &alpha, rows, n, EPS, nt);
+            let (rs, ry) = (max_rel(&ws, &gs), max_rel(&wy, &gy));
+            eprintln!("[add_rmsnorm_blk VULKAN] {rows}x{n} nt={nt}  s_rel={rs:.2e} y_rel={ry:.2e}");
+            assert!(rs < 2e-3 && ry < 2e-3, "add_rmsnorm {rows}x{n} s={rs} y={ry}");
         }
     }
 
