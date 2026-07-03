@@ -445,6 +445,167 @@ pub fn matvec_q8_dp4a_i8_run<R: Runtime>(
 }
 
 // ============================================================================================
+// ============================================================================================
+// Q8_0 PACKED matvec -- reads the REAL production layout (9 u32/block: fp16 scale in the low half of
+// word 0, then 32 signed int8 packed 4/word in words 1..8), matching `mul_mat_vec_q8_sg`. f32
+// activations (int8-weight x f32-act). In-kernel fp16 decode + signed int8 extract + block-per-row
+// shared-mem reduction -- a true drop-in for the packed buffer ml already dispatches, not a synthetic
+// layout. This is the production-swap-shaped kernel (vs the synthetic-layout dp4a benchmark below).
+// ============================================================================================
+
+// fp16 bits (low 16 of `h`) -> f32. Bit-exact for the normal + zero fp16 domain (Q8_0 block scales are
+// always a normal positive fp16 = amax/127); exp bias fixup 15->127 is +112<<10 = 0x1C000, mant<<13.
+#[device]
+fn f16lo_to_f32(h: u32) -> f32 {
+    let sign = (h & 0x8000) << 16;
+    let mag = h & 0x7FFF;
+    let mut bits = sign;
+    if mag != 0 {
+        bits = sign | ((mag + 0x1C000) << 13);
+    }
+    f32::reinterpret(bits)
+}
+
+// signed 8-bit lane `p` in {0,8,16,24} of `word` as a float, sign-extended (b in 0..255 -> b-256 if b>=128).
+#[device]
+fn i8lane<F: Float>(word: u32, p: u32) -> F {
+    let b = (word >> p) & 255;
+    let mut v = F::cast_from(b);
+    if b >= 128 {
+        v -= F::new(256.0);
+    }
+    v
+}
+
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn matvec_q8_0_packed_blk<F: Float>(
+    w: &Array<u32>, // packed Q8_0, 9 u32/block  [rows * k/32 * 9]
+    x: &Array<F>,   // f32 activations, length k
+    out: &mut Array<F>,
+    #[comptime] k: usize,
+    #[comptime] nt: usize, // threads per block (one block per row)
+) {
+    let row = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let nblocks = k / 32;
+    let wbase = row * nblocks * 9;
+    let per = nblocks / nt; // blocks per thread (nblocks a multiple of nt); bounded loop lowers clean
+    let mut partial = F::new(0.0);
+    for j in 0..per {
+        let b = j * nt + t;
+        let off = wbase + b * 9;
+        let scale = F::cast_from(f16lo_to_f32(w[off]));
+        let xb = b * 32;
+        let mut bsum = F::new(0.0);
+        for jj in 0..8 {
+            let word = w[off + 1 + jj];
+            let xo = xb + jj * 4;
+            bsum += i8lane::<F>(word, 0) * x[xo];
+            bsum += i8lane::<F>(word, 8) * x[xo + 1];
+            bsum += i8lane::<F>(word, 16) * x[xo + 2];
+            bsum += i8lane::<F>(word, 24) * x[xo + 3];
+        }
+        partial += scale * bsum;
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        out[row] = smem[0];
+    }
+}
+
+// CPU oracle: decode packed Q8_0 exactly (half::f16 from low 16 bits, signed int8) and dot with f32 x.
+pub fn matvec_q8_0_packed_ref(w: &[u32], x: &[f32], rows: usize, k: usize) -> Vec<f32> {
+    let nblocks = k / 32;
+    let mut out = vec![0f32; rows];
+    for row in 0..rows {
+        let wbase = row * nblocks * 9;
+        let mut acc = 0f32;
+        for b in 0..nblocks {
+            let off = wbase + b * 9;
+            let scale = half::f16::from_bits((w[off] & 0xFFFF) as u16).to_f32();
+            let xb = b * 32;
+            let mut bsum = 0f32;
+            for jj in 0..8 {
+                let word = w[off + 1 + jj];
+                let xo = xb + jj * 4;
+                for lane in 0..4 {
+                    let q = ((word >> (8 * lane as u32)) & 0xFF) as u8 as i8 as f32;
+                    bsum += q * x[xo + lane];
+                }
+            }
+            acc += scale * bsum;
+        }
+        out[row] = acc;
+    }
+    out
+}
+
+// Deterministic packed-Q8_0 test data: random normal fp16 scale + 32 random int8 per block, 9 u32/block.
+pub fn gen_q8_0_packed(rows: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
+    let nblocks = k / 32;
+    let mut s = 0x1234_5678_9ABC_DEF1u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut w = Vec::with_capacity(rows * nblocks * 9);
+    for _ in 0..rows * nblocks {
+        let scale = (next() % 1000) as f32 / 8000.0 + 0.01;
+        w.push(half::f16::from_f32(scale).to_bits() as u32);
+        for _ in 0..8 {
+            let mut word = 0u32;
+            for lane in 0..4 {
+                let q = (next() % 255) as u8; // int8 as bit pattern
+                word |= (q as u32) << (8 * lane);
+            }
+            w.push(word);
+        }
+    }
+    let x: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    (w, x)
+}
+
+// Host launch + kernel-only bench for the packed-Q8_0 block matvec.
+pub fn matvec_q8_0_packed_run<R: Runtime>(
+    client: &ComputeClient<R>, w: &[u32], x: &[f32], rows: usize, k: usize, nt: usize, bench_iters: usize,
+) -> (Vec<f32>, f64) {
+    let wh = client.create_from_slice(u32::as_bytes(w));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    let launch = |c: &ComputeClient<R>| unsafe {
+        matvec_q8_0_packed_blk::launch_unchecked::<f32, R>(
+            c, Grid::Static(rows as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(xh.clone(), k),
+            ArrayArg::from_raw_parts(oh.clone(), rows),
+            k, nt,
+        );
+    };
+    launch(client);
+    let bytes = client.read_one_unchecked(oh.clone());
+    let out = f32::from_bytes(&bytes).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..bench_iters { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let ms = t.elapsed().as_secs_f64() * 1000.0 / bench_iters as f64;
+    (out, ms)
+}
+
 // BLOCK-per-row dp4a matvec: the bandwidth-bound pattern. One thread block owns one output row;
 // its `nt` threads stride over the k/4 groups so ADJACENT threads read ADJACENT Vector<i8,4>
 // (consecutive 4-byte loads -> coalesced 256B transactions), vs the one-thread-per-row kernel whose
