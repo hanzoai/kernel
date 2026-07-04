@@ -95,7 +95,20 @@ Reusable, bit-exact kernels — not toys. Each ships with a CPU oracle and a bit
 - **`rope`** — `rope_half` (GPT-NeoX) and `rope_interleaved` (GPT-J) conventions.
 - **`attn`** — `sdpa` and `sdpa_runtime`: GQA + online (flash-style) softmax with a runtime-length KV cache. One stable attention implementation across backends — the structural cure for repetition-collapse.
 
-Run the correctness + throughput gate yourself:
+Call them straight from your own crate — the common case when you fork a model and want the transformer ops without writing kernels. `use hanzo_kernel::prelude::*;` (it brings the `Runtime` trait into scope; you always want it):
+
+```rust
+use hanzo_kernel::cubecl::cpu::{CpuDevice, CpuRuntime};
+use hanzo_kernel::prelude::*;
+
+let client = CpuRuntime::client(&CpuDevice::default()); // or a CUDA/Metal/Vulkan runtime — same call
+
+let normed = hanzo_kernel::norm::rms_norm_run::<CpuRuntime>(&client, &x, &weight, rows, hidden, 1e-6);
+let rotated = hanzo_kernel::rope::rope_run::<CpuRuntime>(&client, &x, &cos, &sin, rows, head_dim, /*interleaved=*/false);
+let y = hanzo_kernel::quant::matvec_q8_run::<CpuRuntime>(&client, &scales, &qweight, &x, out_rows, k);
+```
+
+`cargo run --example model_ops` runs all of them; `cargo run --example hello_kernel` shows authoring a `#[kernel]`. Run the correctness + throughput gate yourself:
 
 ```bash
 cargo run --release --bin matvec-check --no-default-features --features "cpu,vulkan"
