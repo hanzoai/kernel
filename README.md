@@ -94,6 +94,7 @@ Reusable, bit-exact kernels — not toys. Each ships with a CPU oracle and a bit
 - **`norm`** — `rms_norm`, `layer_norm`, `add_rmsnorm` (fused, multi-output).
 - **`rope`** — `rope_half` (GPT-NeoX) and `rope_interleaved` (GPT-J) conventions.
 - **`attn`** — `sdpa` and `sdpa_runtime`: GQA + online (flash-style) softmax with a runtime-length KV cache. One stable attention implementation across backends — the structural cure for repetition-collapse.
+- **`gdn`** — Gated-DeltaNet linear-attention for hybrid `qwen3_5_moe` archs (Qwen3.5 / 3.6 / AgentWorld): `gdn_conv1d` (causal depthwise conv1d + SiLU), `gdn_gating` (fused `beta`/`g` gates), `gdn_scan` (the recurrent gated delta-rule, fused into one launch). One source replaces the ops-composed CUDA/ROCm GDN path.
 
 Call them straight from your own crate — the common case when you fork a model and want the transformer ops without writing kernels. `use hanzo_kernel::prelude::*;` (it brings the `Runtime` trait into scope; you always want it):
 
