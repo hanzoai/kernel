@@ -114,6 +114,16 @@ Four ideas, borrowed from Rich Hickey and applied to kernels:
 
 Published and in production. `rms_norm` and `softmax` are live DSL kernels in the [Hanzo ML](https://github.com/hanzoai/ml) inference engine — their hand-written predecessors are deleted. The full op library is bit-exact on CPU, Vulkan, and Metal, and shelf-ready for the backends still on hand-tuned kernels. A generated DSL kernel dispatches through the engine's real Vulkan and Metal pipelines with `maxerr = 0` — the DSL plugs in as a **code generator**, not a second runtime.
 
+## The stack
+
+| Crate | What |
+|---|---|
+| **hanzo-kernel** | this crate — write a GPU kernel once, lower it to every backend |
+| [**hanzo-ml**](https://crates.io/crates/hanzo-ml) | the multi-backend tensor + ML framework (6 backends, the full quant zoo) |
+| [**hanzo-flash-attn**](https://crates.io/crates/hanzo-flash-attn) | flash-attention-2 CUDA kernels |
+| [**hanzo-kernels**](https://crates.io/crates/hanzo-kernels) | the hand-tuned CUDA quant kernels the DSL is migrating |
+| [Hanzo Engine](https://github.com/hanzoai/engine) | the serving engine: OpenAI + Anthropic + MCP APIs |
+
 ## License
 
 BSD-3-Clause. See [LICENSE](./LICENSE).
