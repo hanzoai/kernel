@@ -61,11 +61,16 @@ pub enum Node {
 }
 
 impl Node {
-    /// The class decides fusibility — Map composes, Reduce fences. Same predicate as [`crate::fuse`], on nodes.
+    /// The class decides fusibility — Map composes, Reduce fences. Same predicate as [`crate::fuse`], on
+    /// nodes.
+    ///
+    /// Spelled out per variant, never `_`: every consumer of `class()` compares it for equality rather
+    /// than matching on it, so a wildcard defaulting a new op to Map would mis-partition it in silence —
+    /// with nothing anywhere for the compiler to flag.
     pub fn class(&self) -> Class {
         match self {
+            Node::In(_) | Node::Const(_) | Node::Un(..) | Node::Bin(..) => Class::Map,
             Node::Reduce(..) => Class::Reduce,
-            _ => Class::Map,
         }
     }
     /// The node ids this node reads (its in-edges). Leaves read nothing.
@@ -260,7 +265,9 @@ impl Dag {
                     Node::Un(op, a) => Node::Un(op, remap[a]),
                     Node::Bin(op, a, b) => Node::Bin(op, remap[a], remap[b]),
                     Node::Reduce(r, a) => Node::Reduce(r, remap[a]),
-                    leaf => leaf,
+                    // Leaves reference nothing. Spelled out, not `_`: a new node *with* in-edges falling
+                    // in here would silently keep its stale ids.
+                    leaf @ (Node::In(_) | Node::Const(_)) => leaf,
                 };
                 kept.push(node);
             }
