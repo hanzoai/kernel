@@ -95,6 +95,7 @@ Reusable, bit-exact kernels — not toys. Each ships with a CPU oracle and a bit
 - **`rope`** — `rope_half` (GPT-NeoX) and `rope_interleaved` (GPT-J) conventions.
 - **`attn`** — `sdpa` and `sdpa_runtime`: GQA + online (flash-style) softmax with a runtime-length KV cache. One stable attention implementation across backends — the structural cure for repetition-collapse.
 - **`gdn`** — Gated-DeltaNet linear-attention for hybrid `qwen3_5_moe` archs (Qwen3.5 / 3.6 / AgentWorld): `gdn_conv1d` (causal depthwise conv1d + SiLU), `gdn_gating` (fused `beta`/`g` gates), `gdn_scan` (the recurrent gated delta-rule, fused into one launch). One source replaces the ops-composed CUDA/ROCm GDN path.
+- **`fuse`** — auto-fusion, because **fusion is composition**. `Fuse::new(a).mul(w).add(b).silu().run()` folds a chain of pointwise Maps into ONE kernel launch with zero materialized intermediates — the functor law `map g . map f == map (g . f)` read right-to-left. Legal fusion is a total function of op *class* (Map = index-local, freely fusible; Reduce = a fence), not a pattern-matcher. Bit-exact-gated three ways (fused kernel == naive N-kernel == plain-Rust reference).
 
 Call them straight from your own crate — the common case when you fork a model and want the transformer ops without writing kernels. `use hanzo_kernel::prelude::*;` (it brings the `Runtime` trait into scope; you always want it):
 

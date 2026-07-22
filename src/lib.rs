@@ -53,3 +53,4 @@ pub mod norm;
 pub mod rope;
 pub mod attn;
 pub mod gdn;
+pub mod fuse;
