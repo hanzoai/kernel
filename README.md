@@ -137,8 +137,14 @@ Published and in production. `rms_norm` and `softmax` are live DSL kernels in th
 | [**hanzo-ml**](https://crates.io/crates/hanzo-ml) | the multi-backend tensor + ML framework (6 backends, the full quant zoo) |
 | [**hanzo-flash-attn**](https://crates.io/crates/hanzo-flash-attn) | flash-attention-2 CUDA kernels |
 | [**hanzo-kernels**](https://crates.io/crates/hanzo-kernels) | the hand-tuned CUDA quant kernels the DSL is migrating |
-| [Hanzo Engine](https://github.com/hanzoai/engine) | the serving engine: OpenAI + Anthropic + MCP APIs |
+| [Hanzo Engine](https://github.com/hanzoai/engine) | the model-serving engine — `/v1` inference, agents, and MCP |
 
 ## License
 
 BSD-3-Clause. See [LICENSE](./LICENSE).
+
+## Hanzo — the Open AI Cloud
+
+Open source · every language · on-chain settlement. [hanzo.ai](https://hanzo.ai) · [docs.hanzo.ai](https://docs.hanzo.ai)
+
+**SDKs in every language** — [Python](https://github.com/hanzoai/python-sdk) (flagship) · [TypeScript](https://github.com/hanzo-js/sdk) · [Go](https://github.com/hanzo-go/sdk) · [Rust](https://github.com/hanzo-rs/sdk) · [C++](https://github.com/hanzo-cpp/sdk) · [Swift](https://github.com/hanzo-swift/sdk) · [Kotlin](https://github.com/hanzo-kt/sdk) · [umbrella](https://github.com/hanzoai/sdk)
